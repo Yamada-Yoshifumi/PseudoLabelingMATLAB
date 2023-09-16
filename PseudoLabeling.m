@@ -1,0 +1,342 @@
+classdef PseudoLabeling
+   properties
+      name;
+      model_name;
+      use_SymBac;
+      continuous_tuning;
+      synthetic_only;
+      number_of_trenches;
+      time_frame_each_ite;
+      step_forward_each_ite;
+      time_frame_number;
+   end
+   properties (SetAccess=private)
+      fine_tuned = false;
+      prev_length = 0;
+   end
+   properties (Constant)
+      models_list = ["1.2_0.75.hdf5", "1.5_0.775.hdf5", "2.0_0.8.hdf5", "2.5_0.825.hdf5", "3.0_0.85.hdf5", "3.5_0.875.hdf5", "4.0_0.9.hdf5", "4.5_0.925.hdf5"];
+   end
+   methods
+       function obj = PseudoLabeling(options)
+            arguments
+               options.model_name (1,1) {mustBeText} = "1.5_0.775.hdf5";
+               options.use_SymBac (1,1) {mustBeNumericOrLogical}= true;
+               options.continuous_tuning (1,1) {mustBeNumericOrLogical}= true;
+               options.synthetic_only (1,1) {mustBeNumericOrLogical} = false;
+               options.number_of_trenches (1,1) {mustBeNumeric} = 20;
+               options.time_frame_each_ite (1,1) {mustBeNumeric} = 20;
+               options.step_forward_each_ite (1,1) {mustBeNumeric} = 20;
+               options.time_frame_number (1,1) {mustBeNumeric} = 1000;
+            end
+            
+            %if nargin == 0
+            %   options.model_name = "1.5_0.775.hdf5";
+            %   options.use_SymBac = true;
+            %   options.continuous_tuning = true;
+            %   options.synthetic_only = false;
+            %   options.number_of_trenches = 20;
+            %   options.time_frame_each_ite = 20;
+            %   options.step_forward_each_ite = 20;
+            %   options.time_frame_number = 1000;
+            %end
+            % Constructor
+            obj.name = "Pseudo-Labeling";
+            obj.model_name = options.model_name;
+            obj.use_SymBac = options.use_SymBac;
+            obj.continuous_tuning = options.continuous_tuning;
+            obj.synthetic_only = options.synthetic_only;
+            obj.number_of_trenches = options.number_of_trenches;
+            obj.time_frame_each_ite = options.time_frame_each_ite;
+            obj.step_forward_each_ite = options.step_forward_each_ite;
+            obj.time_frame_number = options.time_frame_number;
+       end
+       function result = normalize99(obj, Y, options)
+           arguments
+               obj;
+               Y;
+               options.lower = 0.01;
+               options.upper = 99.99;
+           end
+           X = Y;
+           percentile_1 = prctile(X, options.lower, "all");
+           percentile_99 = prctile(X, options.upper, "all");
+           % Normalize and scale the data
+           normalized_data = double(X - percentile_1) / double(percentile_99 - percentile_1);
+           normalized_data = normalized_data .* 255;
+           
+           % Round the normalized data to the nearest integer
+           normalized_data = round(normalized_data);
+           
+           % Map values below 1st percentile to 0 and above 99th percentile to 255
+           normalized_data(normalized_data < 0) = 0;
+           normalized_data(normalized_data > 255) = 255;
+          
+           result = normalized_data;
+       end
+       function result = erode(obj, img, kernel)
+           img_copy = img;
+           kernel_size = [kernel(1) kernel(2)];
+           half_length = int16((kernel_size(1)-1)/2);
+           for j = 1:size(img, 1)
+
+               for i = 1:size(img, 2)
+
+                   if(j > half_length && j < size(img, 1) - half_length && i > half_length && i < size(img, 2) - half_length)
+                       temp_img = [];
+                       for m = 1:half_length
+                           for n = 1:half_length - m
+                               temp_img = [temp_img, img(j+m, i+n)];
+                               temp_img = [temp_img, img(j-m, i+n)];
+                               temp_img = [temp_img, img(j+m, i-n)];
+                               temp_img = [temp_img, img(j-m, i-n)];
+                           end
+                       end
+                       disp(temp_img);
+                       if not(all(temp_img == img(j, i)))
+                           disp("got one");
+                           img_copy(j, i) = 0;
+                       end
+                   end
+               end
+           end
+           result = img_copy;
+       end
+       function cell_statistics = cell_statistics(obj, image_array)
+           average_length_images_array = [];
+           average_width_images_array = [];
+           mean_length = 0;
+           mean_width = 0;
+           var_length = 0;
+           var_width = 0;
+           cell_count = 0;
+           for index = 1:size(image_array, 1)
+               image = squeeze(image_array(index, :, :));
+               image = bwlabel(image, 4);
+               stats = regionprops("table", int8(image),"Centroid","MajorAxisLength","MinorAxisLength");
+               majorAxisLengths = stats.MajorAxisLength(stats.MajorAxisLength*0.065 > 0.5)*0.065;
+               minorAxisLengths = stats.MinorAxisLength(stats.MajorAxisLength*0.065 > 0.5)*0.065;
+
+               for i=1:size(majorAxisLengths)
+                   mean_length = mean_length + majorAxisLengths(i);
+                   mean_width = mean_width + minorAxisLengths(i);
+                   var_length = var_length + (majorAxisLengths(i))^2;
+                   var_width = var_width + (minorAxisLengths(i))^2;
+                   cell_count = cell_count + 1;
+               end
+
+           end
+           mean_length = mean_length/cell_count;
+           mean_width = mean_width/cell_count;
+           var_length = var_length/cell_count - mean_length^2;
+           var_width = var_width/cell_count - mean_width^2;
+
+           cell_statistics = [mean_length mean_width var_length var_width];
+       end
+       function results = train(obj, epochs, initialized, mlapp)
+            dataSetDir = 'pseudo_train';
+            imageDir = fullfile(dataSetDir,'convolutions');
+            labelDir = fullfile(dataSetDir,'masks');
+            
+            images = dir(fullfile(dataSetDir, "convolutions", "*.tif"));
+            labels = dir(fullfile(dataSetDir, "masks", "*.tif"));
+
+            imds = imageDatastore(imageDir);
+            imds.ReadFcn = @customReadDatastoreImage;
+
+            pxds = imageDatastore(labelDir);
+            pxds.ReadFcn = @customReadPixelLabelDatastoreImage;
+                        
+            imageSize = [256, 64];
+            numClasses = 2;
+            encoderDepth = 4;
+            
+            lgraph = unetLayers(imageSize,numClasses,'EncoderDepth',encoderDepth);
+            weightedSegmentationLayer = WeightedSegmentationLayer("WeightedSegmentationLayer", 40);
+            
+            
+            % Initialize a variable to hold the sum of all images
+            sumImage = 0;
+            
+            % Compute the sum of all images
+            for i = 1:length(imds.Files)
+                img = readimage(imds, i);
+                sumImage = sumImage + double(img);
+            end
+            
+            % Compute the mean image
+            meanImage = sumImage / length(imds.Files);
+            if (~initialized)
+                %inputLayer = imageInputLayer([256, 64, 1], 'Normalization', 'zerocenter', 'Name', 'ImageInputLayer', 'Mean', meanImage);
+                %lgraph = replaceLayer(lgraph,"ImageInputLayer", inputLayer);
+                %lgraph = removeLayers(lgraph, 'Segmentation-Layer');
+                %net = dlnetwork(lgraph);
+                net = load("DS/test_net_1.mat").test_net_1;
+            else
+                net = load("DS/fine_tuned_net.mat").test_net_1;
+            end
+            
+            ds = combine(imds,pxds);
+
+            numEpochs = epochs;
+            miniBatchSize = 40;
+            mbq = minibatchqueue(ds,...
+                MiniBatchSize=miniBatchSize, ...
+                MiniBatchFormat={'SSBC', ''}, ...
+                OutputEnvironment="auto");
+            
+            initialLearnRate = 0.0001;
+            learningRate = initialLearnRate;
+            gradientDecayFactor = 0.001;
+            squaredGradientDecayFactor = 0.5;
+            trailingAvgGenerator = [];
+            trailingAvgSqGenerator = [];
+
+            epoch = 0;
+            iteration = 0;
+            
+            % Loop over epochs.
+            while epoch < numEpochs
+                
+                epoch = epoch + 1;
+            
+                % Shuffle data.
+                shuffle(mbq);
+                
+                % Loop over mini-batches.
+                while hasdata(mbq)
+                    
+                    iteration = iteration + 1;
+
+                    [X, T] = next(mbq);
+
+                    if size(X, 4) == miniBatchSize
+                        [loss,gradients,state] = dlfeval(@modelLoss,net, weightedSegmentationLayer,X,T);
+                        [net,trailingAvgDiscriminatorScale1,trailingAvgSqDiscriminatorScale1] = adamupdate(net,gradients,trailingAvgGenerator,trailingAvgSqGenerator,iteration, ...
+                            learningRate,gradientDecayFactor,squaredGradientDecayFactor);
+                        mlapp.trainingLossObtained(loss);
+                        %recordMetrics(monitor,iteration,Loss=loss);
+                        %updateInfo(monitor,Epoch=epoch,LearnRate=learnRate);
+                        %monitor.Progress = 100 * iteration/numIterations;
+                    end
+                end
+            end
+            
+            test_net_1 = net;
+            save("DS/fine_tuned_net.mat", "test_net_1");
+       end
+
+       function symbac_generation(obj, save_dir, n_samples, cell_statistics)
+            terminate(pyenv);
+            pyenv('Version', ... 
+            '/home/ameyasu/cuda_ws/src/SyMBac/.env/bin/python3.10', ... 
+            'ExecutionMode','OutOfProcess');
+            if (cell_statistics(3) > 0.1*cell_statistics(1))
+                cell_statistics(3) = 0.1*cell_statistics(1);
+            end
+            if (cell_statistics(4) > 0.1*cell_statistics(2))
+                cell_statistics(4) = 0.1*cell_statistics(2);
+            end
+            pyrunfile("./symbac_generate.py", save_dir=save_dir, n_samples=py.int(n_samples), length_mean = py.float(cell_statistics(1)), width_mean=py.float(cell_statistics(2)), length_var=py.float(0.07), width_var=py.float(0.03));
+       end
+
+       function evaluate(obj, initialized)
+            
+            inputFolder = './pseudo_test/convolutions';
+            outputFolder = './pseudo_test/masks';
+            mkdir(outputFolder); % Create the output folder if it doesn't exist
+            if (initialized)
+                s = load("DS/fine_tuned_net.mat");
+            else
+                s = load("DS/test_net_1.mat");
+            end
+            net = s.test_net_1;
+            %classes = load("DS/test_net_1.mat").classes;
+            
+            weightedSegLayer = WeightedSegmentationLayer("Output_Layer", 40);
+            imageFiles = fullfile(inputFolder); % List all JPG files in input folder
+            imageFileNames = dir( fullfile(inputFolder));
+            imageFileNames = imageFileNames(3:length(imageFileNames));
+            
+            imds = imageDatastore(imageFiles);
+            
+            miniBatchSize = 1;
+            imds.ReadSize = miniBatchSize;
+            
+            mbq = minibatchqueue(imds,...
+                "MiniBatchSize",miniBatchSize,...
+                "MiniBatchFcn", @preprocessMiniBatch,...
+                "MiniBatchFormat","SSBC");
+            
+            i = 1;
+            
+            while hasdata(mbq)
+            
+                % Read input image
+                %inputImage = imread(fullfile(inputFolder, imageFiles(i).name));
+                %data = imresize(inputImage,[256 64]);
+                %data = im2double(data);
+                %pseudoLabeling = PseudoLabeling();
+                %data = dlarray(pseudoLabeling.normalize99(data));
+                
+                data = next(mbq);
+            
+                % Perform Semantic Segmentation
+                %segmentationResult = semanticseg(data, net); % 'net' is your pretrained network
+                YPred = predict(net, data);
+                dlSegmentationResult = weightedSegLayer.predict(YPred);
+                % Extract base file name without extension
+                [~, baseFileName, ~] = fileparts(imageFileNames(i).name);
+                
+                % Save Segmentation Result as TIFF with original file name
+                outputImageFilename = fullfile(outputFolder, [baseFileName '.tif']);
+                segmentationResult = extractdata(dlSegmentationResult);
+                segmentationResultCpu = gather(segmentationResult);
+                segmentationResultCleaned = bwareaopen(uint8(segmentationResultCpu), 80);
+                segmentationResultCleaned = imfill(uint8(segmentationResultCleaned));
+                imwrite(uint8(segmentationResultCleaned), outputImageFilename);
+                i = i+1;
+            end
+       end
+   end
+end
+
+function data = customReadDatastoreImage(filename)
+    % code from default function: 
+    onState = warning('off', 'backtrace');
+    c = onCleanup(@() warning(onState)); 
+    img = imread(filename); % added lines:
+    img = imresize(img,[256 64]);
+    img = im2double(img);
+    pseudoLabeling = PseudoLabeling();
+    data = pseudoLabeling.normalize99(img);
+end
+
+function data = customReadPixelLabelDatastoreImage(filename)
+    % code from default function: 
+    onState = warning('off', 'backtrace'); 
+    c = onCleanup(@() warning(onState)); 
+    img = imread(filename); % added lines:
+    img(img > 0.5) = 1;
+    data = imresize(img,[256 64]);
+    data = uint8(data);
+end
+
+function [loss,gradients, state] = modelLoss(net, weightedSegmentationLayer, X, T)
+
+    % Forward data through network.
+    [Y, state] = forward(net, X);
+    % Calculate cross-entropy loss.
+    loss = weightedSegmentationLayer.forwardLoss(Y,T);
+    
+    gradients = dlgradient(loss,net.Learnables);
+    %disp(gradients.Value);
+end
+
+function data = preprocessMiniBatch(cell)
+    data = cell{:};
+    data = imresize(data,[256 64]);
+    pseudoLabeling = PseudoLabeling();
+    data = pseudoLabeling.normalize99(data);
+    data = cat(3, data);
+end

@@ -1,0 +1,6 @@
+*.p
+test_data_MM/*
+complete_timeseries/*
+train/*
+test/*
+DS/*
